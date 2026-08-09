@@ -2,16 +2,35 @@ import { useEffect, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
+import { Check } from 'lucide-react';
 import SignaturePad, { type SignaturePadHandle } from './SignaturePad';
+import { waiverGuestFields, digitsOnly, lettersOnly } from '../../lib/waiver-validation';
+import { business } from '../../lib/business';
+
+/**
+ * Rewrites the field's own value as the guest types, so disallowed characters never
+ * appear at all. Previously the value was only cleaned at submit time (setValueAs), so
+ * you could type letters into a phone box, see them sit there, and get an error later
+ * about something you had no idea was wrong.
+ */
+const sanitize =
+  (clean: (value: string) => string) => (event: React.FormEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const next = clean(input.value);
+    if (next !== input.value) {
+      // Keep the caret where it was rather than throwing it to the end, or typing in
+      // the middle of an already-filled field becomes unusable.
+      const dropped = input.value.length - next.length;
+      const caret = Math.max(0, (input.selectionStart ?? next.length) - dropped);
+      input.value = next;
+      input.setSelectionRange(caret, caret);
+    }
+  };
 
 const schema = z.object({
   groupLeaderName: z.string().trim().max(200).optional(),
   tripDate: z.string().trim().max(50).optional(),
-  guestName: z.string().trim().min(2, 'Enter your name'),
-  guestEmail: z.string().trim().email('Enter a valid email').optional().or(z.literal('')),
-  guestPhone: z.string().trim().min(7, 'Enter a phone number'),
-  emergencyContactName: z.string().trim().min(2, "Enter a contact's name"),
-  emergencyContactPhone: z.string().trim().min(7, 'Enter a phone number'),
+  ...waiverGuestFields,
   agree: z.literal(true, { error: 'You must agree to continue' }),
 });
 
@@ -31,7 +50,9 @@ interface Props {
 export default function WaiverForm({ waiverType, waiverTitle, waiverBodyHtml }: Props) {
   const [groupCode, setGroupCode] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
+  const [signedName, setSignedName] = useState('');
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const confirmRef = useRef<HTMLDivElement>(null);
   const sigRef = useRef<SignaturePadHandle>(null);
   const [sigTouched, setSigTouched] = useState(false);
   const [sigError, setSigError] = useState<string | null>(null);
@@ -49,6 +70,14 @@ export default function WaiverForm({ waiverType, waiverTitle, waiverBodyHtml }: 
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (g) setGroupCode(g);
   }, []);
+
+  // The confirmation replaces the form in place, often below the fold on a phone. Move
+  // focus to it and scroll it up, or a guest can tap Submit and appear to get nothing.
+  useEffect(() => {
+    if (!submitted) return;
+    confirmRef.current?.focus();
+    confirmRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [submitted]);
 
   const {
     register,
@@ -83,7 +112,15 @@ export default function WaiverForm({ waiverType, waiverTitle, waiverBodyHtml }: 
           signaturePng,
         }),
       });
-      if (!res.ok) throw new Error('Submission failed');
+      const response = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) throw new Error(response.error || 'Submission failed');
+      window.localStorage.setItem(
+        `big-dave-waiver:${waiverType}:${groupCode || 'individual'}:${data.guestPhone}`,
+        'signed',
+      );
+      // First name only — "Thank you, Michael" reads like a person wrote it; the full
+      // legal name they just typed into a waiver does not.
+      setSignedName(data.guestName.trim().split(/\s+/)[0] ?? '');
       setSubmitted(true);
     } catch {
       setSubmitError(
@@ -94,13 +131,60 @@ export default function WaiverForm({ waiverType, waiverTitle, waiverBodyHtml }: 
 
   if (submitted) {
     return (
-      <div className="rounded border border-cream/20 bg-cream/[0.06] p-8 text-center">
-        <p className="font-display text-xl uppercase tracking-[0.06em] text-cream">
-          Signed &mdash; you&rsquo;re all set
+      // aria-live + tabIndex: the form is replaced in place, so without an announcement
+      // and a focus target a screen-reader user gets no signal that anything happened.
+      <div
+        ref={confirmRef}
+        tabIndex={-1}
+        aria-live="polite"
+        className="border-cream/20 bg-cream/[0.06] rounded border p-8 text-center outline-none sm:p-10"
+      >
+        <span
+          className="border-cream/30 text-cream mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-full border-2"
+          aria-hidden="true"
+        >
+          <Check size={30} strokeWidth={2} className="signed-check" />
+        </span>
+
+        <h2 className="font-display text-cream text-2xl leading-tight sm:text-[1.75rem]">
+          Thank you{signedName ? `, ${signedName}` : ''}!
+        </h2>
+
+        <p className="text-cream/80 mx-auto mt-4 max-w-sm text-sm leading-relaxed sm:text-base">
+          Your waiver is signed and on file. We hope you enjoy your trip &mdash; tight lines, and
+          we&rsquo;ll see you on the water.
         </p>
-        <p className="mt-3 text-sm text-cream/70">
-          Thanks{groupCode ? `, and see you on the water with the group` : ''}. We&rsquo;ll have
-          this on file for your trip.
+
+        <dl className="border-cream/15 mx-auto mt-7 max-w-xs border-t pt-6 text-left text-sm">
+          <div className="flex items-baseline justify-between gap-4 py-1.5">
+            <dt className="text-cream/55">Waiver</dt>
+            <dd className="text-cream">
+              {waiverType === 'lodge' ? 'Wilson River Lodge' : 'Fishing Adventure'}
+            </dd>
+          </div>
+          {groupCode && (
+            <div className="flex items-baseline justify-between gap-4 py-1.5">
+              <dt className="text-cream/55">Group</dt>
+              <dd className="text-cream break-all">{groupCode}</dd>
+            </div>
+          )}
+          <div className="flex items-baseline justify-between gap-4 py-1.5">
+            <dt className="text-cream/55">Signed</dt>
+            <dd className="text-cream">{new Date().toLocaleDateString()}</dd>
+          </div>
+        </dl>
+
+        <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
+          <a href="/" className="btn btn-solid-light">
+            Back to Home
+          </a>
+          <a href={business.phoneHref} className="btn btn-outline-light">
+            {business.phone}
+          </a>
+        </div>
+
+        <p className="text-cream/45 mt-6 text-xs">
+          Nothing else to do &mdash; there&rsquo;s no copy to print or bring with you.
         </p>
       </div>
     );
@@ -148,8 +232,10 @@ export default function WaiverForm({ waiverType, waiverTitle, waiverBodyHtml }: 
           id="guestName"
           type="text"
           placeholder="Full name"
+          autoComplete="name"
           className={control}
           {...register('guestName')}
+          onInput={sanitize(lettersOnly)}
         />
       </div>
       {errors.guestName && (
@@ -161,7 +247,17 @@ export default function WaiverForm({ waiverType, waiverTitle, waiverBodyHtml }: 
           <label htmlFor="guestPhone" className={label}>
             Phone
           </label>
-          <input id="guestPhone" type="tel" className={control} {...register('guestPhone')} />
+          <input
+            id="guestPhone"
+            type="tel"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            autoComplete="tel"
+            placeholder="5035385607"
+            className={control}
+            {...register('guestPhone')}
+            onInput={sanitize(digitsOnly)}
+          />
         </div>
         <div className={field}>
           <label htmlFor="guestEmail" className={label}>
@@ -188,6 +284,7 @@ export default function WaiverForm({ waiverType, waiverTitle, waiverBodyHtml }: 
             placeholder="Name"
             className={control}
             {...register('emergencyContactName')}
+            onInput={sanitize(lettersOnly)}
           />
         </div>
         <div className={field}>
@@ -197,8 +294,11 @@ export default function WaiverForm({ waiverType, waiverTitle, waiverBodyHtml }: 
           <input
             id="emergencyContactPhone"
             type="tel"
+            inputMode="numeric"
+            pattern="[0-9]*"
             className={control}
             {...register('emergencyContactPhone')}
+            onInput={sanitize(digitsOnly)}
           />
         </div>
       </div>
