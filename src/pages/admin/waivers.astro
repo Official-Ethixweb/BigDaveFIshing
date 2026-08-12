@@ -71,8 +71,34 @@ const visibleTeams =
 const appUrl = Astro.url.origin;
 const params = Astro.url.searchParams;
 const created = params.get('team-created') === '1';
-const exists = params.get('team-exists') === '1';
-const badTeam = params.get('team-error') === '1';
+const exists = params.get('team-exists');
+const badTeam = params.get('team-error');
+
+// Which field was wrong, in words. "Complete the team details" told nobody anything.
+const FIELD_PROBLEM: Record<string, string> = {
+  teamNumber: 'Team number must be digits only — no letters or symbols.',
+  leaderName: "Enter the team leader's name — letters only, at least 2 characters.",
+  waiverType: 'Choose a trip type.',
+  tripDate: 'That trip date was not accepted.',
+};
+
+// Values typed on a failed attempt, so the form comes back filled in rather than blank.
+const prev = {
+  teamNumber: params.get('prev_teamNumber') ?? '',
+  leaderName: params.get('prev_leaderName') ?? '',
+  waiverType: params.get('prev_waiverType') ?? 'fishing-adventure',
+  tripDate: params.get('prev_tripDate') ?? '',
+};
+
+// The next unused number, prefilled. Reusing one is the single most common way creating
+// a link fails, and there is no reason to make anyone remember which are taken.
+const nextTeamNumber =
+  prev.teamNumber || String(teams.reduce((highest, t) => Math.max(highest, t.team_number), 0) + 1);
+
+const teamDeleted = params.get('team-deleted') === '1';
+const deletedWith = Number(params.get('with') ?? 0);
+const deletedWaivers = Number(params.get('deleted') ?? 0);
+const deleteFailed = params.get('delete-error') === '1';
 const archivedJustNow = Number(params.get('archived') ?? 0);
 const restoredJustNow = Number(params.get('restored') ?? 0);
 const digestStatus = params.get('digest');
@@ -160,6 +186,31 @@ const digestReason = params.get('reason');
             Archived
           </a>
           .
+        </p>
+      )
+    }
+    {
+      teamDeleted && (
+        <p class="mt-5 border border-ink/20 bg-white p-3 text-sm">
+          Team deleted
+          {deletedWith > 0
+            ? `, along with ${deletedWith} signed waiver${deletedWith === 1 ? '' : 's'}`
+            : ' — no one had signed it'}
+          .
+        </p>
+      )
+    }
+    {
+      deletedWaivers > 0 && (
+        <p class="mt-5 border border-ink/20 bg-white p-3 text-sm">
+          Deleted {deletedWaivers} waiver{deletedWaivers === 1 ? '' : 's'}.
+        </p>
+      )
+    }
+    {
+      deleteFailed && (
+        <p class="mt-5 border border-red-900/20 bg-red-900/5 p-3 text-sm">
+          Nothing was deleted — that record no longer exists.
         </p>
       )
     }
@@ -326,6 +377,20 @@ const digestReason = params.get('reason');
                               <p class="text-xs text-ink/55">
                                 Signed {new Date(member.signed_at + 'Z').toLocaleString()}
                               </p>
+                              {/* For a row that should never have existed — a test entry,
+                                  a double submission. Permanent, so it confirms first and
+                                  stays visually quiet next to Archive, which is the one
+                                  staff should reach for nearly always. */}
+                              <form action="/api/admin/delete" method="post">
+                                <input type="hidden" name="target" value="waivers" />
+                                <input type="hidden" name="ids" value={member.id} />
+                                <button
+                                  class="text-xs text-red-900/70 underline"
+                                  data-confirm={`Permanently delete the waiver signed by ${member.guest_name}? This cannot be undone.`}
+                                >
+                                  Delete
+                                </button>
+                              </form>
                             </li>
                           ))}
                         </ul>
@@ -363,6 +428,34 @@ const digestReason = params.get('reason');
                           </span>
                         </form>
                       )}
+
+                      {/* A link made with the wrong number, a duplicate, a test — things
+                          that should never have existed. Separate from Archive because
+                          this is permanent, and the confirm says exactly how many signed
+                          waivers go with it. */}
+                      <form
+                        action="/api/admin/delete"
+                        method="post"
+                        class={members.length > 0 ? 'mt-3' : 'mt-5 border-t border-ink/10 pt-4'}
+                      >
+                        <input type="hidden" name="target" value="team" />
+                        <input type="hidden" name="teamId" value={team.id} />
+                        <button
+                          class="text-xs text-red-900/70 underline"
+                          data-confirm={
+                            members.length > 0
+                              ? `Permanently delete team ${team.team_number} (${team.leader_name}) AND its ${members.length} signed waiver${members.length === 1 ? '' : 's'}? This cannot be undone.`
+                              : `Permanently delete team ${team.team_number} (${team.leader_name})? No one has signed it. This cannot be undone.`
+                          }
+                        >
+                          Delete team
+                        </button>
+                        <span class="ml-3 text-xs text-ink/50">
+                          {members.length > 0
+                            ? `Removes the team and its ${members.length} signed waiver${members.length === 1 ? '' : 's'}. Permanent.`
+                            : 'Removes this empty team link. Permanent.'}
+                        </span>
+                      </form>
                     </div>
                   </>
                 </article>
@@ -411,6 +504,19 @@ const digestReason = params.get('reason');
                       <p class="text-xs text-ink/55">
                         Signed {new Date(member.signed_at + 'Z').toLocaleString()}
                       </p>
+                      {/* Same permanent delete as on a team card. These sign-ahead rows
+                          are where a mistaken or duplicate entry is most likely to land,
+                          since anyone can submit one from the public page. */}
+                      <form action="/api/admin/delete" method="post">
+                        <input type="hidden" name="target" value="waivers" />
+                        <input type="hidden" name="ids" value={member.id} />
+                        <button
+                          class="text-xs text-red-900/70 underline"
+                          data-confirm={`Permanently delete the waiver signed by ${member.guest_name}? This cannot be undone.`}
+                        >
+                          Delete
+                        </button>
+                      </form>
                     </li>
                   ))}
                 </ul>
@@ -456,29 +562,39 @@ const digestReason = params.get('reason');
         }{
           exists && (
             <p class="mt-4 border border-red-900/20 bg-red-900/5 p-3 text-sm">
-              That team number already exists.
+              Team {exists} already exists — use {nextTeamNumber}, or delete the old one first. Your
+              details are still filled in below.
             </p>
           )
         }{
           badTeam && (
             <p class="mt-4 border border-red-900/20 bg-red-900/5 p-3 text-sm">
-              Complete the team details.
+              {FIELD_PROBLEM[badTeam] ?? 'Check the team details.'}
             </p>
           )
-        }<form action="/api/admin/teams" method="post" class="mt-5 grid gap-4">
+        }<form action="/api/admin/teams" method="post" class="mt-5 grid gap-4" data-team-form>
           <label class="text-sm font-medium"
             >Team number<input
               required
               name="teamNumber"
-              type="number"
-              min="1"
+              type="text"
               inputmode="numeric"
+              pattern="[0-9]+"
+              maxlength="6"
+              autocomplete="off"
+              data-digits
+              value={nextTeamNumber}
               class="mt-1 w-full border border-ink/20 px-3 py-2.5"
             /></label
           ><label class="text-sm font-medium"
             >Team leader name<input
               required
               name="leaderName"
+              minlength="2"
+              maxlength="200"
+              autocomplete="off"
+              data-letters
+              value={prev.leaderName}
               class="mt-1 w-full border border-ink/20 px-3 py-2.5"
             /></label
           ><label class="text-sm font-medium"
@@ -486,7 +602,9 @@ const digestReason = params.get('reason');
               required
               name="waiverType"
               class="mt-1 w-full border border-ink/20 bg-white px-3 py-2.5"
-              ><option value="fishing-adventure">Fishing adventure</option><option value="lodge"
+              ><option value="fishing-adventure" selected={prev.waiverType !== 'lodge'}
+                >Fishing adventure</option
+              ><option value="lodge" selected={prev.waiverType === 'lodge'}
                 >Wilson River Lodge</option
               ></select
             ></label
@@ -494,6 +612,7 @@ const digestReason = params.get('reason');
             >Trip date <span class="font-normal text-ink/50">optional</span><input
               name="tripDate"
               type="date"
+              value={prev.tripDate}
               class="mt-1 w-full border border-ink/20 px-3 py-2.5"
             /></label
           ><button class="btn btn-solid-dark mt-1 w-full" type="submit">Create share link</button>
@@ -503,6 +622,83 @@ const digestReason = params.get('reason');
   </section>
 </AdminLayout>
 <script is:inline define:vars={{ initialCount: waivers.length }}>
+  // The create-team form.
+  //
+  // Two problems it had, both of which lost whatever had been typed. The auto-refresh
+  // below reloads the page when someone signs, which wiped a half-filled form without
+  // warning; and any failed submission came back blank. So: every keystroke is kept in
+  // sessionStorage and restored on load, and the refresh holds off while the form has
+  // unsaved input.
+  const teamForm = document.querySelector('[data-team-form]');
+  const FORM_KEY = 'bigdave.teamForm';
+  const FIELDS = ['teamNumber', 'leaderName', 'waiverType', 'tripDate'];
+
+  // Typed straight into the field: a team number is written on a whiteboard, not
+  // calculated, and a leader's name never contains digits or symbols. Stripping as you
+  // type beats rejecting after submitting.
+  const clean = (input) => {
+    if (input.dataset.digits !== undefined) return input.value.replace(/[^0-9]/g, '').slice(0, 6);
+    if (input.dataset.letters !== undefined)
+      return input.value.replace(/[^\p{L}\s'.-]/gu, '').slice(0, 200);
+    return input.value;
+  };
+
+  if (teamForm) {
+    const numberField = teamForm.elements.teamNumber;
+    const suggested = numberField ? numberField.value : '';
+
+    // A successful create clears the draft; anything else restores it.
+    if (new URLSearchParams(location.search).get('team-created') === '1') {
+      sessionStorage.removeItem(FORM_KEY);
+    } else {
+      try {
+        const saved = JSON.parse(sessionStorage.getItem(FORM_KEY) || 'null');
+        if (saved) {
+          for (const name of FIELDS) {
+            const field = teamForm.elements[name];
+            if (field && saved[name]) field.value = saved[name];
+          }
+        }
+      } catch {
+        /* a corrupt draft is not worth failing the page over */
+      }
+    }
+
+    teamForm.addEventListener('input', (event) => {
+      if (event.target && event.target.dataset) {
+        const cleaned = clean(event.target);
+        if (cleaned !== event.target.value) event.target.value = cleaned;
+      }
+      const draft = {};
+      for (const name of FIELDS) {
+        const field = teamForm.elements[name];
+        if (field) draft[name] = field.value;
+      }
+      sessionStorage.setItem(FORM_KEY, JSON.stringify(draft));
+    });
+
+    teamForm.addEventListener('submit', () => sessionStorage.removeItem(FORM_KEY));
+
+    // "Dirty" means there is something worth protecting: a name or date typed, or a team
+    // number changed from the one we suggested.
+    window.__teamFormDirty = () =>
+      Boolean(
+        (teamForm.elements.leaderName && teamForm.elements.leaderName.value.trim()) ||
+        (teamForm.elements.tripDate && teamForm.elements.tripDate.value) ||
+        (numberField && numberField.value !== suggested),
+      );
+  }
+
+  // Deletion is permanent, so every button carrying data-confirm has to be agreed to
+  // first. Attached to submit rather than click so keyboard submission is covered too.
+  document.querySelectorAll('[data-confirm]').forEach((button) => {
+    const form = button.closest('form');
+    if (form)
+      form.addEventListener('submit', (event) => {
+        if (!window.confirm(button.dataset.confirm)) event.preventDefault();
+      });
+  });
+
   document.querySelectorAll('[data-copy]').forEach((button) =>
     button.addEventListener('click', async () => {
       await navigator.clipboard.writeText(button.dataset.copy);
@@ -554,10 +750,17 @@ const digestReason = params.get('reason');
 
         const { count } = await res.json();
         if (count !== known) {
-          known = count;
-          if (status) status.textContent = 'New waiver signed — updating…';
-          location.reload();
-          return;
+          // Never reload out from under someone mid-sentence. The whole point of this
+          // poller is convenience, and destroying a half-written team link to deliver it
+          // is a bad trade. It waits, says so, and reloads once the form is clear.
+          if (window.__teamFormDirty && window.__teamFormDirty()) {
+            if (status) status.textContent = 'New waiver signed — refreshing once you’re done';
+          } else {
+            known = count;
+            if (status) status.textContent = 'New waiver signed — updating…';
+            location.reload();
+            return;
+          }
         }
       } catch {
         // Offline or the dev server restarted. Back off instead of retrying every 15s.
