@@ -2,7 +2,13 @@ import type { APIRoute } from 'astro';
 import { z } from 'zod';
 import { db, ensureSchema } from '../../lib/db';
 import { waiverGuestFields } from '../../lib/waiver-validation';
-import { callerKey, submissionRetryAfter } from '../../lib/submission-throttle';
+import { validCustomerSession } from '../../lib/customer-auth';
+import { envSetting } from '../../lib/env';
+import {
+  callerKey,
+  recordAcceptedSubmission,
+  submissionRetryAfter,
+} from '../../lib/submission-throttle';
 
 // On-demand, not prerendered: this route writes to the database on each request.
 export const prerender = false;
@@ -51,9 +57,12 @@ const schema = z.object({
   signaturePng: signaturePngField,
 });
 
-export const POST: APIRoute = async ({ request }) => {
-  // Checked before parsing, so a flood costs us as little work as possible.
-  const retryAfter = submissionRetryAfter(callerKey(request));
+export const POST: APIRoute = async ({ request, cookies }) => {
+  // Checked before parsing, so a flood costs us as little work as possible. This spends
+  // the attempt budget; the smaller stored-submission budget is only spent once a row
+  // actually lands, so a guest fixing a typo is not charged for the mistake.
+  const caller = callerKey(request);
+  const retryAfter = submissionRetryAfter(caller);
   if (retryAfter > 0) {
     return new Response(
       JSON.stringify({ error: 'Too many submissions from this connection. Please try shortly.' }),
@@ -74,7 +83,7 @@ export const POST: APIRoute = async ({ request }) => {
   const parsed = schema.safeParse(body);
   if (!parsed.success) {
     return new Response(
-      JSON.stringify({ error: 'Invalid submission', details: parsed.error.flatten() }),
+      JSON.stringify({ error: 'Invalid submission', details: z.flattenError(parsed.error) }),
       {
         status: 400,
       },
@@ -84,6 +93,19 @@ export const POST: APIRoute = async ({ request }) => {
   const w = parsed.data;
 
   await ensureSchema();
+
+  // Best-effort, and never required: a guest with no account, an expired session, or
+  // this deployment simply not having CUSTOMER_SESSION_SECRET set all fall through to
+  // the same customerId of null, which is exactly today's behaviour for every waiver
+  // ever signed. This only ever adds a link for someone who happens to already be
+  // signed in while they sign - see the column's own note in db.ts for why nothing
+  // here ever tries to guess the link retroactively.
+  const customerSession = await validCustomerSession(
+    cookies.get('big_dave_customer')?.value,
+    envSetting('CUSTOMER_SESSION_SECRET'),
+  );
+  const customerId = customerSession?.id ?? null;
+
   let team: { leader_name: string; trip_date: string | null } | undefined;
   if (w.groupCode) {
     const result = await db.execute({
@@ -101,12 +123,15 @@ export const POST: APIRoute = async ({ request }) => {
     }
   }
 
+  let signedAt: string;
   try {
-    await db.execute({
+    const inserted = await db.execute({
       sql: `INSERT INTO waivers
       (waiver_type, group_code, group_leader_name, trip_date, guest_name, guest_email,
-       guest_phone, emergency_contact_name, emergency_contact_phone, signature_png)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       guest_phone, emergency_contact_name, emergency_contact_phone, minor_names, signature_png,
+       customer_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING signed_at`,
       args: [
         w.waiverType,
         w.groupCode || null,
@@ -117,13 +142,27 @@ export const POST: APIRoute = async ({ request }) => {
         w.guestPhone,
         w.emergencyContactName,
         w.emergencyContactPhone,
+        // NULL rather than "[]" when nobody is listed, so "brought no kids" and "signed
+        // before the form asked" stay distinguishable in the column.
+        w.minorNames.length ? JSON.stringify(w.minorNames) : null,
         w.signaturePng,
+        customerId,
       ],
     });
+    signedAt = String(inserted.rows[0]!.signed_at);
   } catch (error) {
     if (error instanceof Error && /unique/i.test(error.message)) {
+      // Two different duplicate rules now guard this table (see the indexes in
+      // src/lib/db.ts), so the reason has to say which one was hit. "Already submitted
+      // for this phone number" was the old catch-all and it described neither case
+      // accurately - it read as a permanent ban to a guest who had simply signed twice
+      // in one sitting.
       return new Response(
-        JSON.stringify({ error: 'A waiver has already been submitted for this phone number.' }),
+        JSON.stringify({
+          error: w.groupCode
+            ? 'Someone has already signed with this phone number for this trip.'
+            : 'This phone number has already signed this waiver today. There is nothing else to do.',
+        }),
         {
           status: 409,
           headers: { 'Content-Type': 'application/json' },
@@ -133,7 +172,15 @@ export const POST: APIRoute = async ({ request }) => {
     throw error;
   }
 
-  return new Response(JSON.stringify({ ok: true }), {
+  // The row is in the table, so this is the point the expensive budget is spent.
+  recordAcceptedSubmission(caller);
+
+  // Returned so the confirmation screen can show the same date the dashboard will -
+  // see the note on WaiverForm.tsx's use of it. Without this the confirmation used to
+  // print the guest's own device clock, in their own timezone if the app ever gets a
+  // real one, which does not have to agree with the server's own record of the
+  // moment this INSERT actually happened.
+  return new Response(JSON.stringify({ ok: true, signedAt }), {
     status: 201,
     headers: { 'Content-Type': 'application/json' },
   });

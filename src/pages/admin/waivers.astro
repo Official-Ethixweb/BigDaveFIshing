@@ -4,6 +4,7 @@ import AdminLayout from '../../layouts/AdminLayout.astro';
 import {
   db,
   ensureSchema,
+  parseMinorNames,
   WAIVER_LIST_COLUMNS,
   type WaiverListRow,
   type WaiverTeam,
@@ -12,8 +13,15 @@ import {
 
 import { mailConfig } from '../../lib/email';
 import { getAdminSignaturePng } from '../../lib/admin-signature';
+// Pinned to the shop's locale and timezone. A bare toLocaleString() here renders in the
+// SERVER's settings, not the reader's, because this page is server-rendered.
+import { formatSignedAt, formatTripDate } from '../../lib/dates';
 
 await ensureSchema();
+
+// Deleting is master-only (see api/admin/delete.ts). Staff get the same dashboard minus
+// the delete controls, rather than buttons that only ever answer 403.
+const isMaster = Astro.locals.admin?.role === 'master';
 
 // Archiving is how a finished trip leaves the list, so the default view is everything
 // still live. The archived view is the same page with the filter flipped, nothing is
@@ -21,30 +29,79 @@ await ensureSchema();
 const view = Astro.url.searchParams.get('view') === 'archived' ? 'archived' : 'active';
 const archivedFilter = view === 'archived' ? 'archived_at IS NOT NULL' : 'archived_at IS NULL';
 
+/**
+ * How many waivers one view renders at once.
+ *
+ * There was no limit. Every waiver in the table was selected and rendered, each with its
+ * own lazily-loaded signature request - fine at the three rows this has today, and a
+ * page that takes progressively longer to open every week of a season. 200 is well past
+ * any real trip and keeps the query bounded.
+ *
+ * Nothing becomes unreachable: archiving is how a finished party leaves the active list,
+ * and the archived view holds everything that has left it. The notice below says so
+ * rather than letting rows quietly fall off the end.
+ */
+const WAIVER_PAGE_LIMIT = 200;
+
 // Explicit columns, never SELECT *: signature_png is a base64 blob and pulling 60 of them
 // into this page made it 1 MB. Each signature is fetched separately, lazily, below.
 // The queries are independent, so they run together rather than one after the other.
-const [waiverResult, teamResult, tallyResult, actionsResult] = await Promise.all([
-  db.execute(
-    `SELECT ${WAIVER_LIST_COLUMNS} FROM waivers WHERE ${archivedFilter} ORDER BY signed_at DESC`,
-  ),
-  db.execute('SELECT * FROM waiver_teams ORDER BY team_number ASC'),
-  db.execute(
-    `SELECT
+const [waiverResult, teamResult, tallyResult, actionsResult, groupTotalsResult] = await Promise.all(
+  [
+    db.execute(
+      `SELECT ${WAIVER_LIST_COLUMNS} FROM waivers WHERE ${archivedFilter}
+       ORDER BY signed_at DESC LIMIT ${WAIVER_PAGE_LIMIT}`,
+    ),
+    db.execute('SELECT * FROM waiver_teams ORDER BY team_number ASC'),
+    db.execute(
+      `SELECT
+       COUNT(*) AS total,
        SUM(CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END) AS archived,
        SUM(CASE WHEN archived_at IS NULL AND emailed_at IS NULL THEN 1 ELSE 0 END) AS queued
      FROM waivers`,
-  ),
-  db.execute('SELECT * FROM admin_actions ORDER BY created_at DESC LIMIT 15'),
-]);
+    ),
+    db.execute('SELECT * FROM admin_actions ORDER BY created_at DESC LIMIT 15'),
+    // Deliberately NOT filtered by the current view. Everything else on this page shows
+    // one view at a time, but deleting a team takes its waivers with it whether they are
+    // archived or not, so the warning has to count all of them. Counting the visible ones
+    // told an operator who had just archived a finished trip that nobody had signed it,
+    // and then deleted the lot.
+    db.execute(
+      `SELECT group_code,
+         COUNT(*) AS total,
+         SUM(CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END) AS archived
+       FROM waivers
+       WHERE group_code IS NOT NULL
+       GROUP BY group_code`,
+    ),
+  ],
+);
 
 const recentActions = actionsResult.rows as unknown as AdminAction[];
-// One signature lookup per distinct admin on the page, not per row - the same person's
-// last five actions share one fetch instead of five identical ones.
-const signaturesByKey = new Map<string, string | null>();
-for (const key of new Set(recentActions.map((a) => a.admin_key))) {
-  signaturesByKey.set(key, await getAdminSignaturePng(key));
-}
+
+/**
+ * Which admins on this page have a signature at all - not the image itself.
+ *
+ * All this decides is whether a row shows the signature or the logo-and-name stand-in.
+ * The image is then fetched by the browser from /api/admin/admin-signature?key=…, one
+ * lookup per distinct admin here and one HTTP request per distinct admin there, cached
+ * and shared by every row that names the same person.
+ *
+ * It used to hold the base64 data URL and write it into the markup once per row, which
+ * on a nine-entry page was 106 kB of a 216 kB document - the same mistake that had
+ * already been fixed for guest signatures, repeated here where the duplication is worse.
+ */
+// Looked up together rather than one after another. This was an `await` inside a `for`,
+// so N distinct admins meant N sequential round trips to the database before the page
+// could start rendering - each one waiting on the last for no reason, since none of them
+// depends on any other.
+const distinctAdminKeys = [...new Set(recentActions.map((a) => a.admin_key))];
+const signaturePresence = await Promise.all(
+  distinctAdminKeys.map(async (key) => [key, Boolean(await getAdminSignaturePng(key))] as const),
+);
+const adminsWithSignature = new Set(
+  signaturePresence.filter(([, present]) => present).map(([key]) => key),
+);
 
 const ACTION_LABEL: Record<string, string> = {
   'waiver.archive': 'Archived',
@@ -54,18 +111,49 @@ const ACTION_LABEL: Record<string, string> = {
   'team.delete': 'Deleted',
   'staff.create': 'Added staff',
   'staff.remove': 'Removed staff',
+  'staff.change-password': 'Changed their password',
   'digest.send': 'Emailed roster',
 };
 
-const tally = tallyResult.rows[0] as unknown as { archived: number | null; queued: number | null };
+const tally = tallyResult.rows[0] as unknown as {
+  total: number | null;
+  archived: number | null;
+  queued: number | null;
+};
 const archivedCount = Number(tally?.archived ?? 0);
 const queuedCount = Number(tally?.queued ?? 0);
+
+/**
+ * Every waiver in the table, archived or not.
+ *
+ * This is the number the live poller is seeded with, and it has to be counted the same
+ * way /api/admin/waiver-count counts it - which is unfiltered. It used to be seeded with
+ * `waivers.length`, the CURRENT VIEW's row count, so the moment a single waiver was
+ * archived the two disagreed permanently: the poller saw a changed count on its first
+ * tick, reloaded, was re-seeded with the same filtered number, and reloaded again every
+ * 15 seconds for as long as the dashboard was open. Archiving one finished trip made the
+ * page unusable.
+ */
+const totalCount = Number(tally?.total ?? 0);
 const mail = mailConfig();
 const mailReady = 'config' in mail;
 
 const waivers = waiverResult.rows as unknown as WaiverListRow[];
 const teams = teamResult.rows as unknown as WaiverTeam[];
 const teamCodes = new Set(teams.map((team) => team.group_code));
+
+/**
+ * How many waivers a team really has, and how many of those are archived, across both
+ * views. `signedByGroup` below only ever holds the current view's rows, so it cannot
+ * answer "what would deleting this team destroy?" - see the query comment above.
+ */
+const totalsByGroup = new Map<string, { total: number; archived: number }>();
+for (const row of groupTotalsResult.rows) {
+  totalsByGroup.set(String(row.group_code), {
+    total: Number(row.total ?? 0),
+    archived: Number(row.archived ?? 0),
+  });
+}
 const signedByGroup = new Map<string, WaiverListRow[]>();
 for (const waiver of waivers) {
   // Grouped under a team only if that team still exists. A waiver carrying a group_code
@@ -112,10 +200,20 @@ const prev = {
   tripDate: params.get('prev_tripDate') ?? '',
 };
 
-// The next unused number, prefilled. Reusing one is the single most common way creating
-// a link fails, and there is no reason to make anyone remember which are taken.
-const nextTeamNumber =
-  prev.teamNumber || String(teams.reduce((highest, t) => Math.max(highest, t.team_number), 0) + 1);
+// The next unused number. Reusing one is the single most common way creating a link
+// fails, and there is no reason to make anyone remember which are taken.
+//
+// Deliberately independent of what was typed. One value used to serve two jobs - prefill
+// the box, and suggest a free number - and on the one screen where the suggestion matters,
+// a duplicate-number error, it had just been overwritten with the number that failed. The
+// advice read "Team 1 already exists. Use 1".
+const nextFreeTeamNumber = String(
+  teams.reduce((highest, t) => Math.max(highest, t.team_number), 0) + 1,
+);
+
+// What the box shows: whatever was typed on a failed attempt, so nothing is entered
+// twice, otherwise the free number as a starting point.
+const teamNumberValue = prev.teamNumber || nextFreeTeamNumber;
 
 const teamDeleted = params.get('team-deleted') === '1';
 const deletedWith = Number(params.get('with') ?? 0);
@@ -165,12 +263,25 @@ const digestReason = params.get('reason');
         <p class="mt-2 flex items-center gap-2 text-xs text-ink/50">
           <span class="inline-block h-1.5 w-1.5 rounded-full bg-green-700" aria-hidden="true"
           ></span>
-          <span data-live-status>Watching for new waivers</span>
+          {
+            /* The starting count rides on a data attribute rather than through
+               `define:vars`. define:vars forces the script to be `is:inline`, which means
+               Astro neither compiles nor hashes it - and an unhashed inline script is
+               refused outright under the Content-Security-Policy this site now sends. As
+               a data attribute the value is just markup, and the script below is an
+               ordinary compiled module covered by 'self'. */
+          }
+          <span data-live-status data-initial-count={String(totalCount)}
+            >Watching for new waivers</span
+          >
         </p>
       </div>
       <div class="flex flex-col items-end gap-2">
         <a href="/admin/signature" class="border border-ink/25 px-4 py-2 text-sm">
           Your signature
+        </a>
+        <a href="/admin/change-password" class="border border-ink/25 px-4 py-2 text-sm">
+          Change password
         </a>
         {
           /* Only the master account can create or remove staff logins - shown only to
@@ -211,6 +322,19 @@ const digestReason = params.get('reason');
     {
       /* One row of feedback for the actions that leave and come back: archiving,
          restoring, and sending. Read off the query string the redirect set. */
+    }
+    {
+      /* Said out loud rather than letting the oldest rows drop off the end unannounced.
+         Only appears once the view is actually full. */
+      waivers.length >= WAIVER_PAGE_LIMIT && (
+        <p class="mt-5 border border-ink/20 bg-white p-3 text-sm">
+          Showing the {WAIVER_PAGE_LIMIT} most recent{view === 'archived' ? ' archived' : ''}{' '}
+          waivers.{' '}
+          {view === 'archived'
+            ? 'Older ones are still in the database and are not deleted.'
+            : 'Archive the parties you have finished with to clear this list.'}
+        </p>
+      )
     }
     {
       archivedJustNow > 0 && (
@@ -315,6 +439,13 @@ const digestReason = params.get('reason');
             visibleTeams.map((team) => {
               const members = signedByGroup.get(team.group_code) || [];
               const link = `${appUrl}/waivers/${team.waiver_type}?g=${team.group_code}`;
+              // What Delete team would actually destroy: every waiver under this code,
+              // not just the ones this view happens to be showing.
+              const totals = totalsByGroup.get(team.group_code) ?? { total: 0, archived: 0 };
+              const signedWord = `signed waiver${totals.total === 1 ? '' : 's'}`;
+              // Called out separately because these are the ones not on screen, and
+              // therefore the ones an operator does not expect to lose.
+              const archivedNote = totals.archived > 0 ? ` (${totals.archived} archived)` : '';
               return (
                 <article class="border border-ink/15 bg-white">
                   <>
@@ -327,16 +458,21 @@ const digestReason = params.get('reason');
                           </>
                         </div>
                         <p class="text-sm text-cream/75">
-                          {members.length} signed{team.trip_date ? ` · ${team.trip_date}` : ''}
+                          {members.length} signed
+                          {team.trip_date ? ` · ${formatTripDate(team.trip_date)}` : ''}
                         </p>
                       </>
                     </div>
                     <div class="p-5">
                       <div class="mt-2 flex gap-2">
                         <>
+                          {/* Named, because a bare readonly box reads as "edit text,
+                              blank" to a screen reader. The team number is in the name so
+                              a page of these is distinguishable one from another. */}
                           <input
                             readonly
                             value={link}
+                            aria-label={`Signing link for team ${team.team_number} (${team.leader_name})`}
                             class="min-w-0 flex-1 border border-ink/20 bg-cream px-3 py-2 text-xs"
                           />
                           <button
@@ -393,16 +529,31 @@ const digestReason = params.get('reason');
                               {/* Fetched per-signature and lazily: only the ones actually
                                   scrolled into view are ever requested, and each is
                                   cached immutably after that. width/height are set so
-                                  the row does not reflow as they arrive. */}
-                              <img
-                                src={`/api/admin/signature/${member.id}`}
-                                alt={`Signature of ${member.guest_name}`}
-                                width="96"
-                                height="36"
-                                loading="lazy"
-                                decoding="async"
-                                class="h-9 w-24 border border-ink/15 bg-cream object-contain"
-                              />
+                                  the row does not reflow as they arrive.
+
+                                  Wrapped in a link because at thumbnail size you can tell
+                                  that someone signed but not what they wrote, and this is
+                                  a legal record: opening the PNG full size is what makes
+                                  it readable, savable and printable. Same admin-only
+                                  endpoint the thumbnail already uses, so it adds no new
+                                  exposure. */}
+                              <a
+                                href={`/api/admin/signature/${member.id}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={`View ${member.guest_name}'s signature full size`}
+                                class="shrink-0"
+                              >
+                                <img
+                                  src={`/api/admin/signature/${member.id}`}
+                                  alt={`Signature of ${member.guest_name}. Opens full size.`}
+                                  width="96"
+                                  height="36"
+                                  loading="lazy"
+                                  decoding="async"
+                                  class="h-9 w-24 border border-ink/15 bg-cream object-contain hover:border-ink/50"
+                                />
+                              </a>
                               <div class="min-w-40 flex-1">
                                 <p class="font-medium">{member.guest_name}</p>
                                 <p class="text-xs text-ink/60">
@@ -421,24 +572,31 @@ const digestReason = params.get('reason');
                                     {member.emergency_contact_phone}
                                   </a>
                                 </p>
+                                {parseMinorNames(member.minor_names).length > 0 && (
+                                  <p class="text-xs text-ink/70">
+                                    Under 18: {parseMinorNames(member.minor_names).join(', ')}
+                                  </p>
+                                )}
                               </div>
                               <p class="text-xs text-ink/55">
-                                Signed {new Date(member.signed_at + 'Z').toLocaleString()}
+                                Signed {formatSignedAt(member.signed_at)}
                               </p>
                               {/* For a row that should never have existed, a test entry,
                                   a double submission. Permanent, so it confirms first and
                                   stays visually quiet next to Archive, which is the one
                                   staff should reach for nearly always. */}
-                              <form action="/api/admin/delete" method="post">
-                                <input type="hidden" name="target" value="waivers" />
-                                <input type="hidden" name="ids" value={member.id} />
-                                <button
-                                  class="text-xs text-red-900/70 underline"
-                                  data-confirm={`Permanently delete the waiver signed by ${member.guest_name}? This cannot be undone.`}
-                                >
-                                  Delete
-                                </button>
-                              </form>
+                              {isMaster && (
+                                <form action="/api/admin/delete" method="post">
+                                  <input type="hidden" name="target" value="waivers" />
+                                  <input type="hidden" name="ids" value={member.id} />
+                                  <button
+                                    class="inline-flex min-h-11 items-center px-1 text-xs text-red-900/70 underline"
+                                    data-confirm={`Permanently delete the waiver signed by ${member.guest_name}? This cannot be undone.`}
+                                  >
+                                    Delete
+                                  </button>
+                                </form>
+                              )}
                             </li>
                           ))}
                         </ul>
@@ -480,30 +638,33 @@ const digestReason = params.get('reason');
                       {/* A link made with the wrong number, a duplicate, a test, things
                           that should never have existed. Separate from Archive because
                           this is permanent, and the confirm says exactly how many signed
-                          waivers go with it. */}
-                      <form
-                        action="/api/admin/delete"
-                        method="post"
-                        class={members.length > 0 ? 'mt-3' : 'mt-5 border-t border-ink/10 pt-4'}
-                      >
-                        <input type="hidden" name="target" value="team" />
-                        <input type="hidden" name="teamId" value={team.id} />
-                        <button
-                          class="text-xs text-red-900/70 underline"
-                          data-confirm={
-                            members.length > 0
-                              ? `Permanently delete team ${team.team_number} (${team.leader_name}) AND its ${members.length} signed waiver${members.length === 1 ? '' : 's'}? This cannot be undone.`
-                              : `Permanently delete team ${team.team_number} (${team.leader_name})? No one has signed it. This cannot be undone.`
-                          }
+                          waivers go with it - counted across both views, because archived
+                          ones are deleted too and are the ones not on screen to notice. */}
+                      {isMaster && (
+                        <form
+                          action="/api/admin/delete"
+                          method="post"
+                          class={members.length > 0 ? 'mt-3' : 'mt-5 border-t border-ink/10 pt-4'}
                         >
-                          Delete team
-                        </button>
-                        <span class="ml-3 text-xs text-ink/50">
-                          {members.length > 0
-                            ? `Removes the team and its ${members.length} signed waiver${members.length === 1 ? '' : 's'}. Permanent.`
-                            : 'Removes this empty team link. Permanent.'}
-                        </span>
-                      </form>
+                          <input type="hidden" name="target" value="team" />
+                          <input type="hidden" name="teamId" value={team.id} />
+                          <button
+                            class="inline-flex min-h-11 items-center px-1 text-xs text-red-900/70 underline"
+                            data-confirm={
+                              totals.total > 0
+                                ? `Permanently delete team ${team.team_number} (${team.leader_name}) AND its ${totals.total} ${signedWord}${archivedNote}? This cannot be undone.`
+                                : `Permanently delete team ${team.team_number} (${team.leader_name})? No one has signed it. This cannot be undone.`
+                            }
+                          >
+                            Delete team
+                          </button>
+                          <span class="ml-3 text-xs text-ink/50">
+                            {totals.total > 0
+                              ? `Removes the team and its ${totals.total} ${signedWord}${archivedNote}. Permanent.`
+                              : 'Removes this empty team link. Permanent.'}
+                          </span>
+                        </form>
+                      )}
                     </div>
                   </>
                 </article>
@@ -526,22 +687,31 @@ const digestReason = params.get('reason');
                   </div>
                   <p class="text-sm text-cream/75">
                     {members.length} signed
-                    {members[0]?.trip_date ? ` · ${members[0].trip_date}` : ''}
+                    {members[0]?.trip_date ? ` · ${formatTripDate(members[0].trip_date)}` : ''}
                   </p>
                 </div>
 
                 <ul class="divide-y divide-ink/10 p-5 pt-0">
                   {members.map((member) => (
                     <li class="flex flex-wrap items-center gap-4 py-3">
-                      <img
-                        src={`/api/admin/signature/${member.id}`}
-                        alt={`Signature of ${member.guest_name}`}
-                        width="96"
-                        height="36"
-                        loading="lazy"
-                        decoding="async"
-                        class="h-9 w-24 border border-ink/15 bg-cream object-contain"
-                      />
+                      {/* Same link-to-full-size as on a team card, for the same reason. */}
+                      <a
+                        href={`/api/admin/signature/${member.id}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={`View ${member.guest_name}'s signature full size`}
+                        class="shrink-0"
+                      >
+                        <img
+                          src={`/api/admin/signature/${member.id}`}
+                          alt={`Signature of ${member.guest_name}. Opens full size.`}
+                          width="96"
+                          height="36"
+                          loading="lazy"
+                          decoding="async"
+                          class="h-9 w-24 border border-ink/15 bg-cream object-contain hover:border-ink/50"
+                        />
+                      </a>
                       <div class="min-w-40 flex-1">
                         <p class="font-medium">{member.guest_name}</p>
                         <p class="text-xs text-ink/60">
@@ -554,23 +724,28 @@ const digestReason = params.get('reason');
                             {member.emergency_contact_phone}
                           </a>
                         </p>
+                        {parseMinorNames(member.minor_names).length > 0 && (
+                          <p class="text-xs text-ink/70">
+                            Under 18: {parseMinorNames(member.minor_names).join(', ')}
+                          </p>
+                        )}
                       </div>
-                      <p class="text-xs text-ink/55">
-                        Signed {new Date(member.signed_at + 'Z').toLocaleString()}
-                      </p>
+                      <p class="text-xs text-ink/55">Signed {formatSignedAt(member.signed_at)}</p>
                       {/* Same permanent delete as on a team card. These sign-ahead rows
                           are where a mistaken or duplicate entry is most likely to land,
                           since anyone can submit one from the public page. */}
-                      <form action="/api/admin/delete" method="post">
-                        <input type="hidden" name="target" value="waivers" />
-                        <input type="hidden" name="ids" value={member.id} />
-                        <button
-                          class="text-xs text-red-900/70 underline"
-                          data-confirm={`Permanently delete the waiver signed by ${member.guest_name}? This cannot be undone.`}
-                        >
-                          Delete
-                        </button>
-                      </form>
+                      {isMaster && (
+                        <form action="/api/admin/delete" method="post">
+                          <input type="hidden" name="target" value="waivers" />
+                          <input type="hidden" name="ids" value={member.id} />
+                          <button
+                            class="inline-flex min-h-11 items-center px-1 text-xs text-red-900/70 underline"
+                            data-confirm={`Permanently delete the waiver signed by ${member.guest_name}? This cannot be undone.`}
+                          >
+                            Delete
+                          </button>
+                        </form>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -616,8 +791,8 @@ const digestReason = params.get('reason');
         }{
           exists && (
             <p class="mt-4 border border-red-900/20 bg-red-900/5 p-3 text-sm">
-              Team {exists} already exists. Use {nextTeamNumber}, or delete the old one first. Your
-              details are still filled in below.
+              Team {exists} already exists. Use {nextFreeTeamNumber}, or delete the old one first.
+              Your details are still filled in below.
             </p>
           )
         }{
@@ -637,7 +812,7 @@ const digestReason = params.get('reason');
               maxlength="6"
               autocomplete="off"
               data-digits
-              value={nextTeamNumber}
+              value={teamNumberValue}
               class="mt-1 w-full border border-ink/20 px-3 py-2.5"
             /></label
           ><label class="text-sm font-medium"
@@ -688,13 +863,17 @@ const digestReason = params.get('reason');
         ) : (
           <ul class="mt-5 divide-y divide-ink/10 border border-ink/15 bg-white">
             {recentActions.map((entry) => {
-              const signature = signaturesByKey.get(entry.admin_key);
+              const hasSignature = adminsWithSignature.has(entry.admin_key);
               return (
                 <li class="flex flex-wrap items-center gap-4 p-4">
-                  {signature ? (
+                  {hasSignature ? (
                     <img
-                      src={signature}
+                      src={`/api/admin/admin-signature?key=${encodeURIComponent(entry.admin_key)}`}
                       alt={`${entry.admin_name}'s signature`}
+                      width="80"
+                      height="36"
+                      loading="lazy"
+                      decoding="async"
                       class="h-9 w-20 border border-ink/15 bg-cream object-contain"
                     />
                   ) : (
@@ -715,9 +894,7 @@ const digestReason = params.get('reason');
                       {(ACTION_LABEL[entry.action] ?? entry.action).toLowerCase()}
                       {entry.target && <> &middot; {entry.target}</>}
                     </p>
-                    <p class="text-xs text-ink/50">
-                      {new Date(entry.created_at + 'Z').toLocaleString()}
-                    </p>
+                    <p class="text-xs text-ink/50">{formatSignedAt(entry.created_at)}</p>
                   </div>
                 </li>
               );
@@ -728,7 +905,7 @@ const digestReason = params.get('reason');
     </div>
   </section>
 </AdminLayout>
-<script is:inline define:vars={{ initialCount: waivers.length }}>
+<script>
   // The create-team form.
   //
   // Two problems it had, both of which lost whatever had been typed. The auto-refresh
@@ -736,14 +913,29 @@ const digestReason = params.get('reason');
   // warning; and any failed submission came back blank. So: every keystroke is kept in
   // sessionStorage and restored on load, and the refresh holds off while the form has
   // unsaved input.
-  const teamForm = document.querySelector('[data-team-form]');
+  const teamForm = document.querySelector<HTMLFormElement>('[data-team-form]');
   const FORM_KEY = 'bigdave.teamForm';
   const FIELDS = ['teamNumber', 'leaderName', 'waiverType', 'tripDate'];
+
+  /**
+   * Whether the create-team form holds unsaved input the auto-refresh must not destroy.
+   *
+   * A module-scoped function rather than `window.__teamFormDirty`. The two halves that
+   * need it - the form setup and the poller - are in this one script, so the global was
+   * only ever a way of passing a value across a few lines, and it put an untyped property
+   * on `window` that nothing declared. Defaults to "not dirty" so a page without the form
+   * still refreshes normally.
+   */
+  let teamFormDirty = () => false;
+
+  /** A named control on the team form, or null if the markup no longer carries it. */
+  const fieldNamed = (form: HTMLFormElement, name: string) =>
+    form.elements.namedItem(name) as HTMLInputElement | HTMLSelectElement | null;
 
   // Typed straight into the field: a team number is written on a whiteboard, not
   // calculated, and a leader's name never contains digits or symbols. Stripping as you
   // type beats rejecting after submitting.
-  const clean = (input) => {
+  const clean = (input: HTMLInputElement) => {
     if (input.dataset.digits !== undefined) return input.value.replace(/[^0-9]/g, '').slice(0, 6);
     if (input.dataset.letters !== undefined)
       return input.value.replace(/[^\p{L}\s'.-]/gu, '').slice(0, 200);
@@ -751,7 +943,7 @@ const digestReason = params.get('reason');
   };
 
   if (teamForm) {
-    const numberField = teamForm.elements.teamNumber;
+    const numberField = fieldNamed(teamForm, 'teamNumber');
     const suggested = numberField ? numberField.value : '';
 
     // A successful create clears the draft; anything else restores it.
@@ -759,10 +951,13 @@ const digestReason = params.get('reason');
       sessionStorage.removeItem(FORM_KEY);
     } else {
       try {
-        const saved = JSON.parse(sessionStorage.getItem(FORM_KEY) || 'null');
+        const saved = JSON.parse(sessionStorage.getItem(FORM_KEY) || 'null') as Record<
+          string,
+          string
+        > | null;
         if (saved) {
           for (const name of FIELDS) {
-            const field = teamForm.elements[name];
+            const field = fieldNamed(teamForm, name);
             if (field && saved[name]) field.value = saved[name];
           }
         }
@@ -772,13 +967,14 @@ const digestReason = params.get('reason');
     }
 
     teamForm.addEventListener('input', (event) => {
-      if (event.target && event.target.dataset) {
-        const cleaned = clean(event.target);
-        if (cleaned !== event.target.value) event.target.value = cleaned;
+      const target = event.target;
+      if (target instanceof HTMLInputElement) {
+        const cleaned = clean(target);
+        if (cleaned !== target.value) target.value = cleaned;
       }
-      const draft = {};
+      const draft: Record<string, string> = {};
       for (const name of FIELDS) {
-        const field = teamForm.elements[name];
+        const field = fieldNamed(teamForm, name);
         if (field) draft[name] = field.value;
       }
       sessionStorage.setItem(FORM_KEY, JSON.stringify(draft));
@@ -788,17 +984,19 @@ const digestReason = params.get('reason');
 
     // "Dirty" means there is something worth protecting: a name or date typed, or a team
     // number changed from the one we suggested.
-    window.__teamFormDirty = () =>
+    const leaderField = fieldNamed(teamForm, 'leaderName');
+    const dateField = fieldNamed(teamForm, 'tripDate');
+    teamFormDirty = () =>
       Boolean(
-        (teamForm.elements.leaderName && teamForm.elements.leaderName.value.trim()) ||
-        (teamForm.elements.tripDate && teamForm.elements.tripDate.value) ||
+        leaderField?.value.trim() ||
+        dateField?.value ||
         (numberField && numberField.value !== suggested),
       );
   }
 
   // Deletion is permanent, so every button carrying data-confirm has to be agreed to
   // first. Attached to submit rather than click so keyboard submission is covered too.
-  document.querySelectorAll('[data-confirm]').forEach((button) => {
+  document.querySelectorAll<HTMLElement>('[data-confirm]').forEach((button) => {
     const form = button.closest('form');
     if (form)
       form.addEventListener('submit', (event) => {
@@ -806,19 +1004,41 @@ const digestReason = params.get('reason');
       });
   });
 
-  document.querySelectorAll('[data-copy]').forEach((button) =>
+  // The Clipboard API is unavailable outside a secure context and can be refused by
+  // permission policy, and it rejects rather than throwing synchronously. Unguarded, a
+  // dashboard opened over plain http on the shop LAN had a Copy button that did nothing
+  // at all: no copy, no error, no "Copied", just an unhandled rejection in a console
+  // nobody has open. Falling back to selecting the field means the link can always be
+  // copied by hand, and the button says which of the two just happened.
+  document.querySelectorAll<HTMLElement>('[data-copy]').forEach((button) => {
+    const label = button.textContent;
+    const flash = (message: string) => {
+      button.textContent = message;
+      setTimeout(() => (button.textContent = label), 1600);
+    };
+
     button.addEventListener('click', async () => {
-      await navigator.clipboard.writeText(button.dataset.copy);
-      const text = button.textContent;
-      button.textContent = 'Copied';
-      setTimeout(() => (button.textContent = text), 1600);
-    }),
-  );
+      try {
+        await navigator.clipboard.writeText(button.dataset.copy ?? '');
+        flash('Copied');
+      } catch {
+        // Put the link in front of them, selected, so Ctrl+C finishes the job.
+        const input = button.closest('div')?.querySelector<HTMLInputElement>('input[readonly]');
+        if (input) {
+          input.focus();
+          input.select();
+          flash('Press Ctrl+C');
+        } else {
+          flash('Copy failed');
+        }
+      }
+    });
+  });
 
   // Native share sheet. Revealed only where the browser actually has one, so it is never
   // a button that does nothing.
   if (navigator.share) {
-    document.querySelectorAll('[data-share]').forEach((button) => {
+    document.querySelectorAll<HTMLElement>('[data-share]').forEach((button) => {
       button.hidden = false;
       button.addEventListener('click', async () => {
         try {
@@ -839,8 +1059,19 @@ const digestReason = params.get('reason');
   // page is server-rendered and grouping a new signature under the right team by hand
   // would duplicate that logic in the browser, for a page one person has open.
   (function pollForNewWaivers() {
-    const status = document.querySelector('[data-live-status]');
-    let known = initialCount;
+    const status = document.querySelector<HTMLElement>('[data-live-status]');
+
+    /**
+     * The count this page was rendered with, read off the element rather than injected
+     * into the script.
+     *
+     * It must be counted the SAME WAY /api/admin/waiver-count counts it - every row in
+     * the table, archived or not. It used to be the current view's row count, so opening
+     * the dashboard with anything archived meant the two could never agree: the first
+     * tick saw a difference, reloaded, was re-seeded with the same filtered number, and
+     * reloaded again every 15 seconds for as long as the page was open.
+     */
+    let known = Number(status?.dataset.initialCount ?? 0);
     let failures = 0;
 
     const tick = async () => {
@@ -860,7 +1091,7 @@ const digestReason = params.get('reason');
           // Never reload out from under someone mid-sentence. The whole point of this
           // poller is convenience, and destroying a half-written team link to deliver it
           // is a bad trade. It waits, says so, and reloads once the form is clear.
-          if (window.__teamFormDirty && window.__teamFormDirty()) {
+          if (teamFormDirty()) {
             if (status) status.textContent = 'New waiver signed. Refreshing once you’re done';
           } else {
             known = count;

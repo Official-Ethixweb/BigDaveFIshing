@@ -4,9 +4,20 @@ import { db, ensureSchema } from '../../../lib/db';
 import { nameField } from '../../../lib/waiver-validation';
 import { customerEmailField, customerPasswordField } from '../../../lib/customer-validation';
 import { hashPassword } from '../../../lib/customer-password';
-import { createCustomerSession, customerSessionMaxAge } from '../../../lib/customer-auth';
+import {
+  createCustomerSession,
+  customerSessionMaxAge,
+  CUSTOMER_HINT_COOKIE,
+} from '../../../lib/customer-auth';
+import { createEmailVerificationToken } from '../../../lib/customer-email-verification';
+import { sendVerificationEmail } from '../../../lib/customer-email-verification-email';
 import { envSetting } from '../../../lib/env';
-import { callerKey, submissionRetryAfter } from '../../../lib/submission-throttle';
+import { siteOrigin } from '../../../lib/site-url';
+import {
+  callerKey,
+  recordAcceptedSubmission,
+  submissionRetryAfter,
+} from '../../../lib/submission-throttle';
 
 export const prerender = false;
 
@@ -25,9 +36,13 @@ const schema = z
 export const POST: APIRoute = async ({ request, cookies, redirect }) => {
   const secret = envSetting('CUSTOMER_SESSION_SECRET');
   if (!secret) {
-    return new Response('Accounts are not configured. Set CUSTOMER_SESSION_SECRET.', {
-      status: 503,
-    });
+    // The missing variable is named in the server log, not to the visitor: they cannot
+    // act on it, and a public page should not report a deployment's configuration. This
+    // used to answer a bare 503 body, which the browser rendered as an unstyled white
+    // page with no navigation - the visitor's only route back was the back button.
+    // /api/booking made the same call and it is the behaviour copied here.
+    console.error('[customer/signup] refused, because CUSTOMER_SESSION_SECRET is not set');
+    return redirect('/signup?error=unavailable', 303);
   }
 
   // Own namespace so this never shares a budget with waiver/booking submissions or
@@ -42,7 +57,7 @@ export const POST: APIRoute = async ({ request, cookies, redirect }) => {
   const raw = Object.fromEntries(await request.formData());
   const parsed = schema.safeParse(raw);
   if (!parsed.success) {
-    const fields = Object.keys(parsed.error.flatten().fieldErrors);
+    const fields = Object.keys(z.flattenError(parsed.error).fieldErrors);
     return redirect(`/signup?error=${fields[0] ?? 'invalid'}`, 303);
   }
 
@@ -63,8 +78,41 @@ export const POST: APIRoute = async ({ request, cookies, redirect }) => {
     throw error;
   }
 
-  cookies.set('big_dave_customer', await createCustomerSession(customerId, secret), {
+  // An account exists now, so this is the point the expensive budget is spent. A visitor
+  // who mistyped their password confirmation three times is not charged for it.
+  recordAcceptedSubmission(caller);
+
+  // Best-effort, and never blocks the signup itself: the account is real and usable
+  // either way (nothing currently checks email_verified_at to gate anything), this is
+  // only what lets /account later tell a customer their address is confirmed rather
+  // than merely claimed. A failure here is logged, not surfaced - the alternative is
+  // failing an otherwise-successful signup over an email the visitor cannot resend
+  // themselves yet at this point in the flow (that's what the resend link on /account
+  // is for).
+  try {
+    const token = await createEmailVerificationToken(customerId);
+    const verifyUrl = `${siteOrigin(request.url)}/api/customer/verify-email?token=${token}`;
+    const outcome = await sendVerificationEmail(parsed.data.email, verifyUrl);
+    if (outcome.status !== 'sent') {
+      console.error('[customer/signup] verification email not sent:', outcome);
+    }
+  } catch (error) {
+    console.error('[customer/signup] verification email threw:', error);
+  }
+
+  // A brand-new row is always at session_version 1 - see that column's default in db.ts.
+  cookies.set('big_dave_customer', await createCustomerSession(customerId, 1, secret), {
     httpOnly: true,
+    sameSite: 'lax',
+    secure: import.meta.env.PROD,
+    path: '/',
+    maxAge: customerSessionMaxAge,
+  });
+
+  // Readable companion cookie so the prerendered footer bar can tell it is showing a
+  // signed-in visitor. Carries no identity - see CUSTOMER_HINT_COOKIE.
+  cookies.set(CUSTOMER_HINT_COOKIE, '1', {
+    httpOnly: false,
     sameSite: 'lax',
     secure: import.meta.env.PROD,
     path: '/',

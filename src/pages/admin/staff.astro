@@ -33,8 +33,9 @@ const problem = errorCode ? (FIELD_PROBLEM[errorCode] ?? 'Check the details and 
       <p class="eyebrow text-ink/65">Staff dashboard</p>
       <h1 class="mt-1 text-3xl md:text-5xl">Manage staff</h1>
       <p class="mt-2 text-sm text-ink/60">
-        Logins created here get the same waiver dashboard access you have. Only the master account
-        can create or remove one.
+        Logins created here can see the waiver dashboard, create team links and archive finished
+        trips. Only the master account can permanently delete a waiver or a team, or create and
+        remove these logins.
       </p>
       <a href="/admin/waivers" class="mt-4 inline-block text-sm underline underline-offset-2"
         >&larr; Back to waivers</a
@@ -131,8 +132,13 @@ const problem = errorCode ? (FIELD_PROBLEM[errorCode] ?? 'Check the details and 
   </section>
 </AdminLayout>
 
-<script is:inline>
-  document.querySelectorAll('[data-confirm]').forEach((button) => {
+{
+  /* Not is:inline: this is plain DOM code with nothing injected into it, so letting
+     Astro compile it means it ships as a bundled module that the Content-Security-Policy
+     covers under 'self', with no hash to keep in step. */
+}
+<script>
+  document.querySelectorAll<HTMLElement>('[data-confirm]').forEach((button) => {
     const form = button.closest('form');
     if (form)
       form.addEventListener('submit', (event) => {

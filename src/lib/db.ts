@@ -26,12 +26,49 @@ import { envVar } from './env';
 let client: Client | null = null;
 function getClient(): Client {
   if (!client) {
-    const url = envVar('TURSO_DATABASE_URL') || 'file:./data/waivers.db';
+    const configured = envVar('TURSO_DATABASE_URL');
+    const url = configured || 'file:./data/waivers.db';
     const authToken = envVar('TURSO_AUTH_TOKEN');
-    // The local-file fallback has no server to create its own directory. A fresh clone
-    // has no ./data yet, and libSQL fails to open the file rather than creating the
-    // parent dir itself - so "zero setup" actually needs this one line.
-    if (url.startsWith('file:')) mkdirSync('./data', { recursive: true });
+
+    if (url.startsWith('file:')) {
+      /**
+       * The local-file fallback is a convenience for `astro dev`, and it cannot work on
+       * a serverless host: the filesystem is read-only outside /tmp, and /tmp does not
+       * survive between invocations. Reaching here in production means TURSO_DATABASE_URL
+       * was never set on the deployment.
+       *
+       * It used to call mkdirSync and let it throw EROFS, which surfaced as a bare 500
+       * on every page that touches the database and named nothing useful - the failure
+       * looked like a code fault rather than a missing environment variable. Saying so
+       * directly is the whole fix; the condition is unchanged.
+       */
+      // Only the FALLBACK is refused, not a file: URL someone configured on purpose.
+      // Deliberately choosing a local file - a self-hosted Node deployment with a real
+      // disk, say - is a decision this has no business overriding; silently falling back
+      // to one on a serverless host is the accident worth stopping.
+      if (import.meta.env.PROD && !configured) {
+        throw new Error(
+          'TURSO_DATABASE_URL is not set. This deployment fell back to a local SQLite file, ' +
+            'which cannot work on a read-only serverless filesystem. Create a database at ' +
+            'https://turso.tech and set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN on the project.',
+        );
+      }
+
+      // A fresh clone has no ./data yet, and libSQL fails to open the file rather than
+      // creating the parent directory itself - so "zero setup" needs this one line.
+      // Wrapped because a directory that already exists, or one another process just
+      // created, must not take the request down.
+      try {
+        mkdirSync('./data', { recursive: true });
+      } catch (error) {
+        throw new Error(
+          `Could not create the local ./data directory for the development database: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
     client = createClient(authToken ? { url, authToken } : { url });
   }
   return client;
@@ -51,7 +88,15 @@ export const db = new Proxy({} as Client, {
 
 let initialized: Promise<void> | null = null;
 
-/** Creates the table on first use. Safe to call on every request; it's a no-op after. */
+/**
+ * Creates the table on first use. Safe to call on every request; it's a no-op after.
+ *
+ * A failure clears the memo rather than keeping it. The promise used to be cached
+ * whatever happened, so one transient error - the database asleep, a network blip on
+ * the first request an instance served - poisoned that instance permanently: every
+ * later request awaited the same rejected promise and 500'd, and only a cold start
+ * ever cleared it. Now a failed attempt is simply retried by the next request.
+ */
 export function ensureSchema() {
   if (!initialized) {
     initialized = db
@@ -68,6 +113,7 @@ export function ensureSchema() {
         guest_phone TEXT NOT NULL,
         emergency_contact_name TEXT NOT NULL,
         emergency_contact_phone TEXT NOT NULL,
+        minor_names TEXT,
         signature_png TEXT NOT NULL,
         signed_at TEXT NOT NULL DEFAULT (datetime('now'))
       )
@@ -75,8 +121,33 @@ export function ensureSchema() {
       )
       .then(() =>
         db.batch([
-          `CREATE UNIQUE INDEX IF NOT EXISTS waivers_one_submission_per_guest
-             ON waivers (waiver_type, COALESCE(group_code, ''), guest_phone)`,
+          /**
+           * Duplicate protection, scoped to the thing being protected against.
+           *
+           * There was one index here: UNIQUE (waiver_type, COALESCE(group_code,''),
+           * guest_phone). For a team link that is right - one person signs once for one
+           * trip. For a sign-ahead waiver, where group_code is NULL, it collapsed to
+           * "this phone number may sign this waiver type once, ever". A guest who fished
+           * last September and booked again this year was told "a waiver has already been
+           * submitted for this phone number" and had no way past it. So was the second
+           * adult in a couple who share a phone. That is a returning customer turned away
+           * by the booking system, which is the most expensive thing this table can do.
+           *
+           * Replaced by two narrower rules, both strictly looser than the old one, so no
+           * existing row can violate them:
+           *
+           *   team link  -> one signature per phone per team. Unchanged behaviour.
+           *   sign-ahead -> one signature per phone per waiver type PER DAY, which still
+           *                 stops a double-tap or a refreshed form, and says nothing about
+           *                 next season.
+           */
+          `DROP INDEX IF EXISTS waivers_one_submission_per_guest`,
+          `CREATE UNIQUE INDEX IF NOT EXISTS waivers_one_per_team_guest
+             ON waivers (waiver_type, group_code, guest_phone)
+             WHERE group_code IS NOT NULL`,
+          `CREATE UNIQUE INDEX IF NOT EXISTS waivers_one_per_day_guest
+             ON waivers (waiver_type, guest_phone, date(signed_at))
+             WHERE group_code IS NULL`,
           `CREATE TABLE IF NOT EXISTS waiver_teams (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             team_number INTEGER NOT NULL UNIQUE,
@@ -100,6 +171,55 @@ export function ensureSchema() {
             password_hash TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
           )`,
+          // A customer's forgot-password flow. Only ever stores the SHA-256 of the
+          // token that goes out in the email, never the token itself - a leaked table
+          // must not hand out working reset links, the same reasoning that already
+          // keeps session cookies signed rather than storing a raw shared secret.
+          // customer_id has no foreign-key ON DELETE action because nothing here ever
+          // deletes a customer row; if that changes, this table needs the same look.
+          `CREATE TABLE IF NOT EXISTS customer_password_resets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+          )`,
+          `CREATE INDEX IF NOT EXISTS customer_password_resets_token_hash ON customer_password_resets (token_hash)`,
+          `CREATE INDEX IF NOT EXISTS customer_password_resets_customer_id ON customer_password_resets (customer_id)`,
+          // A separate table from customer_password_resets rather than a shared one
+          // with a "purpose" column, on purpose: a token leaked or reused across
+          // purposes (a verification link that could also reset a password) is a
+          // strictly worse failure mode than two nearly-identical tables, and the two
+          // are consumed by completely different routes that have no reason to share a
+          // query.
+          `CREATE TABLE IF NOT EXISTS customer_email_verifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+          )`,
+          `CREATE INDEX IF NOT EXISTS customer_email_verifications_token_hash ON customer_email_verifications (token_hash)`,
+          `CREATE INDEX IF NOT EXISTS customer_email_verifications_customer_id ON customer_email_verifications (customer_id)`,
+          // A record of a booking enquiry, kept for a signed-in customer to see on
+          // /account. Written only after the email to Dave has already been confirmed
+          // sent (see sendBookingEnquiry's caller in api/booking.ts) - this table is a
+          // side effect of a successful enquiry, never what decides whether one
+          // succeeded. customer_id is NULL for every enquiry from a visitor who wasn't
+          // signed in, which is most of them; nothing here requires an account.
+          `CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER,
+            name TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            email TEXT,
+            trip_type TEXT NOT NULL,
+            message TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+          )`,
+          `CREATE INDEX IF NOT EXISTS bookings_customer_id ON bookings (customer_id)`,
           // Staff logins the master admin (env-var ADMIN_USER/ADMIN_PASSWORD) creates.
           // Deliberately a separate table from `customers`: two unrelated kinds of
           // account that happen to share a hashing scheme should never share a table,
@@ -137,7 +257,14 @@ export function ensureSchema() {
         ]),
       )
       .then(() => migrate())
-      .then(() => undefined);
+      .then(() => undefined)
+      .catch((error) => {
+        // Drop the memo so the next request starts a fresh attempt, then re-throw so
+        // this caller still fails honestly rather than continuing against a database
+        // whose schema was never confirmed.
+        initialized = null;
+        throw error;
+      });
   }
   return initialized;
 }
@@ -152,7 +279,10 @@ export function ensureSchema() {
  *
  * `archived_at` is set when a human presses Archive on the dashboard. `emailed_at` is
  * set only after a mail provider has confirmed the digest went out, so a failed send
- * leaves the row queued for tomorrow rather than silently dropping it.
+ * leaves the row queued for tomorrow rather than silently dropping it. `minor_names`
+ * holds the under-18s a signing adult is bringing; NULL on every waiver signed before
+ * the form asked, which is not the same as "came alone" and is why nothing infers a
+ * child count from its absence.
  */
 async function migrate() {
   const info = await db.execute('PRAGMA table_info(waivers)');
@@ -161,16 +291,44 @@ async function migrate() {
   const statements = [
     !existing.has('archived_at') && 'ALTER TABLE waivers ADD COLUMN archived_at TEXT',
     !existing.has('emailed_at') && 'ALTER TABLE waivers ADD COLUMN emailed_at TEXT',
+    !existing.has('minor_names') && 'ALTER TABLE waivers ADD COLUMN minor_names TEXT',
+    // NULL for every waiver signed by a guest with no account, which is most of them,
+    // and for every waiver signed before this column existed - both correctly, there is
+    // no account to attribute those to. Set only going forward, at submission time, for
+    // whoever is actually signed in at that moment (api/waivers.ts) - never guessed
+    // afterwards by matching name, phone or email against old rows, which would risk
+    // handing one guest's signed waiver to a different customer's account on nothing
+    // more than a coincidence of contact details.
+    !existing.has('customer_id') && 'ALTER TABLE waivers ADD COLUMN customer_id INTEGER',
   ].filter((sql): sql is string => Boolean(sql));
 
   if (statements.length) await db.batch(statements);
 
   // The dashboard's default view is "not archived", and the digest's query is
   // "not archived and not yet emailed". Both filter on these before ordering.
+  // customer_id is what /account's own waiver list filters and orders by.
   await db.batch([
     `CREATE INDEX IF NOT EXISTS waivers_archived_at ON waivers (archived_at)`,
     `CREATE INDEX IF NOT EXISTS waivers_emailed_at ON waivers (emailed_at)`,
+    `CREATE INDEX IF NOT EXISTS waivers_customer_id ON waivers (customer_id)`,
   ]);
+
+  // Added after `customers` first shipped, same reasoning as above: read the existing
+  // shape, only add what's missing. Every pre-existing row gets DEFAULT 1, which is
+  // exactly right - it is indistinguishable from an account that has never had its
+  // password reset.
+  const customerInfo = await db.execute('PRAGMA table_info(customers)');
+  const customerColumns = new Set(customerInfo.rows.map((row) => String(row.name)));
+  if (!customerColumns.has('session_version')) {
+    await db.execute('ALTER TABLE customers ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1');
+  }
+  // NULL until the address is confirmed. Every row that existed before this column did
+  // starts NULL too - correctly: nobody had proven ownership of their address before
+  // this existed either, so treating pre-existing accounts as verified would be the
+  // one actively wrong default here.
+  if (!customerColumns.has('email_verified_at')) {
+    await db.execute('ALTER TABLE customers ADD COLUMN email_verified_at TEXT');
+  }
 }
 
 export interface WaiverRecord {
@@ -184,12 +342,31 @@ export interface WaiverRecord {
   guest_phone: string;
   emergency_contact_name: string;
   emergency_contact_phone: string;
+  /**
+   * JSON array of the under-18s this adult is bringing, e.g. `["Sam Ruiz","Ada Ruiz"]`.
+   * NULL for waivers signed before the field existed, and for adults bringing no kids.
+   * Read it through `parseMinorNames`, never `JSON.parse` at the call site.
+   */
+  minor_names: string | null;
   signature_png: string;
   signed_at: string;
   /** Set when staff pressed Archive. NULL while the waiver is still on the active list. */
   archived_at: string | null;
   /** Set only after a provider confirmed the digest send that included this row. */
   emailed_at: string | null;
+  /** The signed-in customer who submitted this, if any - see the column's own note in db.ts. */
+  customer_id: number | null;
+}
+
+export interface Booking {
+  id: number;
+  customer_id: number | null;
+  name: string;
+  phone: string;
+  email: string | null;
+  trip_type: string;
+  message: string | null;
+  created_at: string;
 }
 
 /**
@@ -206,8 +383,26 @@ export type WaiverListRow = Omit<WaiverRecord, 'signature_png'>;
 
 /** Column list for list views. Explicit so `SELECT *` can't quietly re-add the blob. */
 export const WAIVER_LIST_COLUMNS = `id, waiver_type, group_code, group_leader_name, trip_date,
-  guest_name, guest_email, guest_phone, emergency_contact_name, emergency_contact_phone, signed_at,
-  archived_at, emailed_at`;
+  guest_name, guest_email, guest_phone, emergency_contact_name, emergency_contact_phone,
+  minor_names, signed_at, archived_at, emailed_at`;
+
+/**
+ * Reads the `minor_names` column back into a list.
+ *
+ * Tolerant on purpose: the column is NULL on every row written before the field shipped,
+ * and a malformed value should cost one waiver its child list, not throw and take down
+ * the whole dashboard or digest send.
+ */
+export function parseMinorNames(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((name): name is string => typeof name === 'string' && name.trim() !== '');
+  } catch {
+    return [];
+  }
+}
 
 export interface WaiverTeam {
   id: number;
@@ -224,6 +419,24 @@ export interface Customer {
   name: string;
   email: string;
   password_hash: string;
+  /**
+   * Bumped on every successful password reset (never on a normal login). A session
+   * cookie signed under an older version fails validation - see customer-auth.ts - so
+   * resetting a password also closes out any session issued before the reset, without
+   * needing a server-side session table.
+   */
+  session_version: number;
+  /** NULL until the address is confirmed via the link sent on signup. See db.ts's migration note. */
+  email_verified_at: string | null;
+  created_at: string;
+}
+
+export interface CustomerPasswordReset {
+  id: number;
+  customer_id: number;
+  token_hash: string;
+  expires_at: string;
+  used_at: string | null;
   created_at: string;
 }
 
